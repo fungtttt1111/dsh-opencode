@@ -1,0 +1,12 @@
+# logs and local state
+*.log
+zen-relay-dump.json
+
+# profile patch backups
+*.bak-*
+*.tmp-*
+
+# editor / OS noise
+.DS_Store
+Thumbs.db
+node_modules/
