@@ -67,6 +67,11 @@ let sessionId = makeSessionId();
 let sessionBornAt = Date.now();
 const SESSION_LIFETIME_MS = 5 * 60 * 1000;
 
+function rotateSession() {
+  sessionId = makeSessionId();
+  sessionBornAt = Date.now();
+}
+
 function identityHeaders() {
   if (Date.now() - sessionBornAt > SESSION_LIFETIME_MS) {
     sessionId = makeSessionId();
@@ -249,8 +254,11 @@ async function handleChat(req, res) {
   const ctrl = new AbortController();
   res.on("close", () => { if (!res.writableEnded) ctrl.abort(); });
 
+  // Free-tier endpoints sometimes cold-start with "Endpoint is unavailable"
+  // for several seconds. Retry on a fresh session before surfacing the error.
+  const RETRY_DELAYS = [0, 1500, 3000, 5000, 8000];
   let upstream = null;
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (let attempt = 1; attempt <= RETRY_DELAYS.length; attempt++) {
     try {
       upstream = await fetch(ZEN_CHAT, { method: "POST", headers: outHeaders, body: outBody, signal: ctrl.signal });
     } catch (e) {
@@ -261,11 +269,12 @@ async function handleChat(req, res) {
     }
     if (upstream.ok) break;
     const retryable = upstream.status === 422 || upstream.status === 503 || upstream.status === 429;
-    if (!retryable || attempt === 3) break;
+    if (!retryable || attempt === RETRY_DELAYS.length) break;
     let reason = "";
     try { reason = (await upstream.text()).slice(0, 200); } catch { /* ignore */ }
     log({ t: "retry", model: shaped.model, status: upstream.status, attempt, upstream: reason });
-    await new Promise((r) => setTimeout(r, 1200 * attempt));
+    rotateSession();
+    await new Promise((r) => setTimeout(r, RETRY_DELAYS[attempt] || 8000));
   }
 
   const ctype = upstream.headers.get("content-type") || "";

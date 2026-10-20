@@ -74,7 +74,7 @@ The default is `9360`. If the port is already served by this version of the rela
 ## Notes and limits
 
 - Free-tier availability, quotas, and rate limits are controlled by OpenCode Zen, not by this plugin.
-- The gateway occasionally cold-starts a free model with a transient `Endpoint is unavailable`; the relay retries briefly before surfacing an error.
+- The gateway occasionally cold-starts a free model with a transient `Endpoint is unavailable`; the relay retries with a short backoff before surfacing an error.
 - OpenCode can rename or retire models at any time; the sync follows the gateway.
 - This project is not affiliated with OpenCode or DeepSeek.
 

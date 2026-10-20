@@ -1,6 +1,6 @@
 {
   "name": "dsh-opencode",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "private": true,
   "description": "OpenCode Zen free models for DeepSeek Harness: keyless local relay, live model list, and per-model reasoning effort.",
   "license": "MIT",
