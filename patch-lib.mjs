@@ -1,7 +1,6 @@
 // patch-lib.mjs — dependency-free helpers that edit a DSH profile patch
 // (cordis.patch.yml). They understand the standard two-space block YAML that
-// DSH writes and refuse to guess on exotic layouts; when that happens the
-// installer tells you to use --print-patch and merge by hand.
+// DSH writes and refuse to guess on exotic layouts.
 //
 // The functions are pure text-in/text-out so they can be unit-tested and run
 // safely against a copy before touching the real profile.
@@ -11,9 +10,9 @@ export const SYNC_END = "# <<< zen-sync:models";
 export const STARTER_MODEL_ID = "deepseek-v4.1-flash-free";
 
 export const PATCH_HEADER = [
-  "# dsh-opencode: OpenCode Zen free models (no API key).",
-  "# The local relay on 127.0.0.1:9360 re-shapes requests like the official",
-  "# OpenCode CLI and uses Zen's keyless free tier; no API key is stored.",
+  "# dsh-opencode — OpenCode Zen free models (no API key).",
+  "# The local relay re-shapes requests like the official OpenCode CLI and",
+  "# uses Zen's keyless free tier; no API key is stored anywhere.",
   "# The model list is regenerated automatically from the gateway and lives",
   "# between the zen-sync markers below. Leave the markers in place.",
 ];
@@ -53,7 +52,6 @@ export function providerBlockLines(port, providersIndent = 4) {
   const p = IND(providersIndent + 2); // provider id key
   const s = IND(providersIndent + 4); // provider settings
   const m = IND(providersIndent + 6); // model list items
-  const f = IND(providersIndent + 8); // model fields
   return [
     `${p}opencode-zen:`,
     `${s}displayName: OpenCode Zen (free)`,
@@ -190,7 +188,7 @@ export function ensureMarkersInLines(lines) {
 }
 
 export function ensureDefaultInLines(lines) {
-  let range = findEntryRange(lines, "agent-default-model");
+  const range = findEntryRange(lines, "agent-default-model");
   if (!range) {
     return { lines: trimTrailingBlanks(lines).concat(defaultEntryLines()), changed: true, actions: ["default-added"] };
   }
@@ -242,7 +240,7 @@ export function applyPluginToPatch(text, { port = 9360, setDefault = true } = {}
     return { text: out, changed: out !== text, actions: ["patch-initialized"] };
   }
 
-  let range = findEntryRange(lines, "llm-pi-ai");
+  const range = findEntryRange(lines, "llm-pi-ai");
   if (!range) {
     lines = trimTrailingBlanks(lines).concat(providerEntryLines(port));
     actions.push("provider-appended");
@@ -276,6 +274,29 @@ export function applyPluginToPatch(text, { port = 9360, setDefault = true } = {}
   let out = lines.join(eol);
   if (!out.endsWith(eol)) out += eol;
   return { text: out, changed: out !== text, actions };
+}
+
+// Keep the relay baseURL in step with the port the plugin actually bound.
+// Only a loopback /v1 URL is rewritten; a custom endpoint is left alone.
+export function setPatchPort(text, port) {
+  const eol = lineEnding(text);
+  const lines = text.split(/\r?\n/);
+  const provIdx = lines.findIndex((l) => /^[ \t]*opencode-zen:[ \t]*$/.test(l));
+  if (provIdx < 0) return { text, changed: false };
+
+  const provIndent = indentOf(lines[provIdx]);
+  for (let i = provIdx + 1; i < lines.length; i++) {
+    const l = lines[i];
+    if (l.trim() && indentOf(l) <= provIndent) break;
+    const m = l.match(/^([ \t]*baseURL:[ \t]*["']?)http:\/\/127\.0\.0\.1:\d+\/v1(["']?[ \t]*)$/);
+    if (m) {
+      const next = `${m[1]}http://127.0.0.1:${port}/v1${m[2]}`;
+      if (next === l) return { text, changed: false };
+      lines[i] = next;
+      return { text: lines.join(eol), changed: true };
+    }
+  }
+  return { text, changed: false };
 }
 
 export function ensureMarkersInText(text) {

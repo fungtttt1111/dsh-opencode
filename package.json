@@ -1,0 +1,40 @@
+{
+  "name": "dsh-opencode",
+  "version": "2.0.0",
+  "private": true,
+  "description": "OpenCode Zen free models for DeepSeek Harness: keyless local relay, live model list, and per-model reasoning effort.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "index.js",
+    "zen-relay.mjs",
+    "patch-lib.mjs",
+    "zen-tools.json",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "opencode",
+    "opencode-zen",
+    "free-models"
+  ]
+}

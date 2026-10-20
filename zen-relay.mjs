@@ -1,45 +1,45 @@
 // zen-relay.mjs — OpenCode Zen shaping relay for DeepSeek Harness
 //
-// Purpose: let DSH (or any OpenAI-compatible client) talk to OpenCode Zen's
-// free tier without a user API key, by reshaping each request to match what
-// the official OpenCode CLI sends. Works exactly like the official client:
+// Runs inside the DSH host (imported by index.js) or standalone:
+//   node zen-relay.mjs
+//
+// It reshapes each request to match what the official OpenCode CLI sends, so
+// the keyless free tier answers exactly as it does for the real client:
 //   endpoint  POST https://opencode.ai/inference/openai/v1/chat/completions
-//   identity  Authorization: Bearer public   (the client's keyless free-tier
-//             token, captured live from a working 2.0.28 client)
+//   identity  Authorization: Bearer public  (the CLI's keyless free-tier token)
 //   headers   x-opencode-client/project/session quartets + b3/traceparent
 //   markers   a tool named "read" present and stream:true
-// Earlier revisions used /zen/v1/chat/completions keyless; that path shares a
-// stricter anonymous bucket (429 FreeUsageLimitError) and no longer reflects
-// what the CLI does.
 //
 // Endpoints:
-//   POST  * /v1/chat/completions   (chat; SSE passthrough or buffered to JSON)
-//   GET   * /v1/models             (proxied from Zen, 5-minute cache)
-//   GET   /sync                    (regenerate the DSH profile model list now)
-//   GET   /healthz
+//   POST  * /v1/chat/completions   chat; SSE passthrough or buffered JSON
+//   GET   * /v1/models             models proxied from Zen, 5-minute cache
+//   GET   /sync                    refresh the profile model list now
+//   GET   /healthz                 liveness
 //
-// Zero dependencies; Node >= 20. Runs on 127.0.0.1:9360 by default.
+// Zero dependencies; Node 20+. Listens on 127.0.0.1 only.
 
 import { createServer } from "node:http";
-import { readFileSync, appendFileSync, existsSync, writeFileSync } from "node:fs";
-import { randomBytes, randomInt } from "node:crypto";
+import { appendFileSync, readFileSync, existsSync, writeFileSync, renameSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const PORT = Number(process.env.ZEN_RELAY_PORT || 9360);
+const HERE = dirname(fileURLToPath(import.meta.url));
+
 const ZEN_BASE = process.env.ZEN_RELAY_UPSTREAM || "https://opencode.ai";
 const ZEN_CHAT = `${ZEN_BASE}/inference/openai/v1/chat/completions`;
+// Bumped when the relay contract changes. The host plugin only reuses a relay
+// on the requested port when its /healthz reports the same version, so an old
+// relay left by a previous install can never be mistaken for this one.
+export const RELAY_VERSION = 2;
 const ZEN_MODELS = `${ZEN_BASE}/zen/v1/models`;
-const LOG_FILE = join(__dirname, "zen-relay.log");
+let LOG_FILE = process.env.ZEN_RELAY_LOG || join(tmpdir(), "dsh-opencode-relay.log");
 
 // ---------------------------------------------------------------------------
-// Client identity (captured from the official OpenCode CLI; keys vary per
-// install, shape is what the gateway checks).
+// Client identity (shape is what the gateway checks; ids are random per run)
 // ---------------------------------------------------------------------------
 const CLIENT_UA = "opencode/latest/2.0.28/cli";
-// The official CLI's keyless free-tier credential (captured live from a working
-// 2.0.28 client via TLS interception; the /inference endpoint accepts it).
 const FREE_TOKEN = "Bearer public";
 
 const B62 = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -51,12 +51,8 @@ const hex = (n) => pick(HEX, n);
 // project. Set ZEN_RELAY_PROJECT to pin a specific value.
 const CLIENT_PROJECT = process.env.ZEN_RELAY_PROJECT || hex(32);
 
-// The official client builds session ids like the CLI does: "ses_" + the six
-// big-endian bytes of the 48-bit bitwise NOT of (Date.now() * 4096 + a
-// per-millisecond sequence counter), followed by 14 random base62 chars.
-// (The complement makes ids sort newest-first, which is why real ids always
-// end in "ffe" for the first id in a millisecond.) Reusing this exact recipe
-// keeps the request indistinguishable from a live client session.
+// The CLI builds session ids as "ses_" + the six big-endian bytes of the
+// 48-bit complement of (Date.now() * 4096 + sequence), plus 14 base62 chars.
 let idLastMs = 0;
 let idSeq = 0;
 function makeSessionId() {
@@ -69,7 +65,7 @@ function makeSessionId() {
 }
 let sessionId = makeSessionId();
 let sessionBornAt = Date.now();
-const SESSION_LIFETIME_MS = 5 * 60 * 1000; // rotate like a fresh client session
+const SESSION_LIFETIME_MS = 5 * 60 * 1000;
 
 function identityHeaders() {
   if (Date.now() - sessionBornAt > SESSION_LIFETIME_MS) {
@@ -89,19 +85,17 @@ function identityHeaders() {
     "x-session-id": sessionId,
     accept: "*/*",
     "accept-encoding": "gzip, deflate, br",
-    "b3": `${traceId}-${spanId}-1-${parentId}`,
-    "traceparent": `00-${traceId}-${spanId}-01`,
+    b3: `${traceId}-${spanId}-1-${parentId}`,
+    traceparent: `00-${traceId}-${spanId}-01`,
   };
 }
 
 // ---------------------------------------------------------------------------
 // Gate marker: the official client always advertises a tool named "read".
-// If an incoming request has no such tool, we add one. Prefer the real
-// definition captured from the CLI (zen-tools.json), else a minimal stub.
 // ---------------------------------------------------------------------------
 let MARKER_READ = { type: "function", function: { name: "read", description: "Read a file", parameters: { type: "object", properties: {} } } };
 try {
-  const captured = JSON.parse(readFileSync(join(__dirname, "zen-tools.json"), "utf8"));
+  const captured = JSON.parse(readFileSync(join(HERE, "zen-tools.json"), "utf8"));
   const real = (captured.tools || []).find((t) => t?.function?.name === "read");
   if (real) MARKER_READ = real;
 } catch { /* keep stub */ }
@@ -110,15 +104,17 @@ const hasToolNamedRead = (tools) =>
   Array.isArray(tools) && tools.some((t) => (t?.function?.name || t?.name) === "read");
 
 // ---------------------------------------------------------------------------
-// Logging (one line per request; bodies never logged)
+// Logging (one metadata line per request; bodies are never logged)
 // ---------------------------------------------------------------------------
-function log(obj) {
+export function setLogFile(path) {
+  if (typeof path === "string" && path.trim()) LOG_FILE = path;
+}
+
+export function log(obj) {
   const line = `[${new Date().toISOString()}] ${JSON.stringify(obj)}\n`;
   try {
     if (existsSync(LOG_FILE) && readFileSync(LOG_FILE).length > 8 * 1024 * 1024) {
-      // simple truncation keeps the log bounded
-      appendFileSync(LOG_FILE, "");
-      import("node:fs").then((fs) => fs.truncateSync(LOG_FILE, 0)).catch(() => {});
+      writeFileSync(LOG_FILE, "");
     }
     appendFileSync(LOG_FILE, line);
   } catch { /* logging must never break serving */ }
@@ -130,7 +126,6 @@ function log(obj) {
 // ---------------------------------------------------------------------------
 function shapeBody(incoming) {
   const out = {};
-  // Preserve client sampling intent where zen understands it.
   for (const k of ["temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty", "seed", "stop", "tool_choice", "parallel_tool_calls", "response_format", "user", "metadata", "logit_bias", "reasoning_effort"]) {
     if (incoming[k] !== undefined) out[k] = incoming[k];
   }
@@ -144,8 +139,7 @@ function shapeBody(incoming) {
   out.stream = true; // required by the gateway
   out.stream_options = { include_usage: true };
   out.store = false;
-  const maxTokens = incoming.max_completion_tokens ?? incoming.max_tokens ?? 32000;
-  out.max_completion_tokens = maxTokens;
+  out.max_completion_tokens = incoming.max_completion_tokens ?? incoming.max_tokens ?? 32000;
   return out;
 }
 
@@ -249,26 +243,29 @@ async function handleChat(req, res) {
   const outBody = JSON.stringify(shaped);
   if (process.env.ZEN_RELAY_DUMP) {
     try {
-      const { writeFileSync } = await import("node:fs");
-      writeFileSync(join(__dirname, "zen-relay-dump.json"), JSON.stringify({ at: new Date().toISOString(), headers: outHeaders, bodyLen: outBody.length, body: shaped }, null, 1));
+      writeFileSync(join(HERE, "zen-relay-dump.json"), JSON.stringify({ at: new Date().toISOString(), headers: outHeaders, bodyLen: outBody.length, body: shaped }, null, 1));
     } catch { /* ignore */ }
   }
   const ctrl = new AbortController();
   res.on("close", () => { if (!res.writableEnded) ctrl.abort(); });
 
-  let upstream;
-  try {
-    upstream = await fetch(ZEN_CHAT, {
-      method: "POST",
-      headers: outHeaders,
-      body: outBody,
-      signal: ctrl.signal,
-    });
-  } catch (e) {
-    if (ctrl.signal.aborted) return; // client went away
-    log({ t: "chat", model: shaped.model, msgs: shaped.messages?.length, tools: shaped.tools?.length, effort: shaped.reasoning_effort || "-", status: `neterr`, ms: Date.now() - started, err: String(e).slice(0, 160) });
-    sendJson(res, 502, { error: { message: `zen-relay: upstream fetch failed: ${String(e)}` } });
-    return;
+  let upstream = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      upstream = await fetch(ZEN_CHAT, { method: "POST", headers: outHeaders, body: outBody, signal: ctrl.signal });
+    } catch (e) {
+      if (ctrl.signal.aborted) return;
+      log({ t: "chat", model: shaped.model, msgs: shaped.messages?.length, tools: shaped.tools?.length, effort: shaped.reasoning_effort || "-", status: "neterr", ms: Date.now() - started, err: String(e).slice(0, 160) });
+      sendJson(res, 502, { error: { message: `zen-relay: upstream fetch failed: ${String(e)}` } });
+      return;
+    }
+    if (upstream.ok) break;
+    const retryable = upstream.status === 422 || upstream.status === 503 || upstream.status === 429;
+    if (!retryable || attempt === 3) break;
+    let reason = "";
+    try { reason = (await upstream.text()).slice(0, 200); } catch { /* ignore */ }
+    log({ t: "retry", model: shaped.model, status: upstream.status, attempt, upstream: reason });
+    await new Promise((r) => setTimeout(r, 1200 * attempt));
   }
 
   const ctype = upstream.headers.get("content-type") || "";
@@ -297,20 +294,17 @@ async function handleChat(req, res) {
           if (!res.write(chunk)) await new Promise((r) => res.once("drain", r));
         }
       } else {
-        // upstream answered non-streamed; forward as a single SSE data event
         const text = await upstream.text();
         res.write(`data: ${text}\n\ndata: [DONE]\n\n`);
       }
     } catch (e) {
-      // mid-stream failure: nothing sane to do but close the stream
-      if (!res.destroyed) { try { res.write(`data: ${JSON.stringify({ error: { message: `zen-relay: stream error ${String(e)}` } })}\n\n`); } catch {} }
+      if (!res.destroyed) { try { res.write(`data: ${JSON.stringify({ error: { message: `zen-relay: stream error ${String(e)}` } })}\n\n`); } catch { /* ignore */ } }
     }
     res.end();
     log({ t: "chat", model: shaped.model, msgs: shaped.messages?.length, tools: shaped.tools?.length, effort: shaped.reasoning_effort || "-", status: 200, stream: true, ms: Date.now() - started });
     return;
   }
 
-  // non-streaming client: buffer the SSE and emit one JSON completion
   try {
     if (isSse) {
       const text = await upstream.text();
@@ -345,20 +339,14 @@ async function handleModels(res) {
 }
 
 // ---------------------------------------------------------------------------
-// Model list sync — keeps the model list in the DSH profile patch in step with
-// the gateway, so models OpenCode adds or removes appear in the app without
-// editing files by hand. Runs at relay start, every SYNC_INTERVAL_MS, and on
-// GET /sync. Writes only when the generated list differs from the file.
-//   ZEN_PATCH             patch file to maintain (default: profile patch)
-//   ZEN_SYNC=off          disable the sync entirely
-//   ZEN_SYNC_INTERVAL_MS  period between checks (default 6h)
+// Model-list sync — keeps the DSH profile patch in step with the gateway.
+// The generated list lives between the zen-sync markers in the patch; the
+// block is rewritten only when it differs.
 // ---------------------------------------------------------------------------
-const SYNC_PATCH = process.env.ZEN_PATCH || join(__dirname, "..", "profiles", "desktop", "cordis.patch.yml");
 const SYNC_INTERVAL_MS = (() => {
   const n = Number(process.env.ZEN_SYNC_INTERVAL_MS);
   return Number.isFinite(n) && n > 0 ? n : 6 * 60 * 60 * 1000;
 })();
-const SYNC_ENABLED = process.env.ZEN_SYNC !== "off";
 const CATALOG_URL = process.env.ZEN_CATALOG_URL || "https://models.dev/api.json";
 const SYNC_BEGIN = "# >>> zen-sync:models";
 const SYNC_END = "# <<< zen-sync:models";
@@ -396,38 +384,40 @@ function syncEffortLevels(meta) {
   return [];
 }
 
-function generateModelLines(ids, catalog, prevOrder) {
+function generateModelLines(ids, catalog, prevOrder, itemIndent = 10) {
   const ordered = [];
   for (const id of prevOrder) if (ids.includes(id) && !ordered.includes(id)) ordered.push(id);
   for (const id of ids) if (!ordered.includes(id)) ordered.push(id);
 
+  const i = " ".repeat(itemIndent);
+  const f = " ".repeat(itemIndent + 2);
   const lines = [];
   for (const id of ordered) {
     const meta = catalog[id] || {};
-    lines.push(`          - id: ${id}`);
-    lines.push(`            name: "${syncDisplayName(id, meta)}"`);
+    lines.push(`${i}- id: ${id}`);
+    lines.push(`${f}name: "${syncDisplayName(id, meta)}"`);
     const ctx = meta.limit && Number(meta.limit.context);
     const out = meta.limit && Number(meta.limit.output);
-    if (Number.isFinite(ctx) && ctx > 0) lines.push(`            contextWindow: ${ctx}`);
-    if (Number.isFinite(out) && out > 0) lines.push(`            maxTokens: ${out}`);
+    if (Number.isFinite(ctx) && ctx > 0) lines.push(`${f}contextWindow: ${ctx}`);
+    if (Number.isFinite(out) && out > 0) lines.push(`${f}maxTokens: ${out}`);
     const ins = meta.modalities && Array.isArray(meta.modalities.input) ? meta.modalities.input : [];
-    if (ins.includes("image")) lines.push(`            input: [ text, image ]`);
+    if (ins.includes("image")) lines.push(`${f}input: [ text, image ]`);
     const efforts = syncEffortLevels(meta);
     if (efforts.length) {
-      lines.push(`            reasoningEfforts:`);
-      for (const e of efforts) lines.push(`              ${e}: ${e}`);
+      lines.push(`${f}reasoningEfforts:`);
+      for (const e of efforts) lines.push(`${f}  ${e}: ${e}`);
     }
   }
   return { ordered, lines };
 }
 
-async function syncModels(reason) {
+export async function syncModels(patchPath, reason = "manual") {
   const started = Date.now();
-  const result = { t: "sync", reason, file: SYNC_PATCH };
+  const result = { t: "sync", reason, file: patchPath };
   try {
     let text;
-    try { text = readFileSync(SYNC_PATCH, "utf8"); }
-    catch { log({ ...result, status: "no-patch" }); return { ok: false, error: `patch not found: ${SYNC_PATCH}` }; }
+    try { text = readFileSync(patchPath, "utf8"); }
+    catch { log({ ...result, status: "no-patch" }); return { ok: false, error: `patch not found: ${patchPath}` }; }
 
     const b = text.indexOf(SYNC_BEGIN);
     const e = text.indexOf(SYNC_END);
@@ -439,9 +429,11 @@ async function syncModels(reason) {
     const nl = text.includes("\r\n") ? "\r\n" : "\n";
     const prevBlock = text.slice(b + SYNC_BEGIN.length, e);
     const prevOrder = [...prevBlock.matchAll(/^[ \t]*- id:[ \t]*(\S+)/gm)].map((m) => m[1]);
-    const { ordered, lines } = generateModelLines(ids, catalog, prevOrder);
+    const markerLine = text.slice(0, b).split(/\r?\n/).pop() || "";
+    const itemIndent = markerLine.length - markerLine.trimStart().length;
+    const { ordered, lines } = generateModelLines(ids, catalog, prevOrder, itemIndent);
 
-    let next = text.slice(0, b + SYNC_BEGIN.length) + nl + lines.join(nl) + nl + "          " + text.slice(e);
+    let next = text.slice(0, b + SYNC_BEGIN.length) + nl + lines.join(nl) + nl + markerLine + text.slice(e);
 
     let defaultSwitched = null;
     const dm = next.match(SYNC_DEFAULT_RE);
@@ -461,7 +453,11 @@ async function syncModels(reason) {
     if (defaultSwitched) result.default = defaultSwitched;
     result.changed = changed;
     result.ms = Date.now() - started;
-    if (changed) writeFileSync(SYNC_PATCH, next);
+    if (changed) {
+      const tmp = `${patchPath}.tmp-${process.pid}`;
+      writeFileSync(tmp, next);
+      renameSync(tmp, patchPath);
+    }
     log(result);
     return { ok: true, ...result };
   } catch (err) {
@@ -471,29 +467,90 @@ async function syncModels(reason) {
   }
 }
 
-async function handleSync(res) {
-  const r = await syncModels("manual");
-  sendJson(res, r.ok ? 200 : 500, r);
+export function startModelSync({ patchPath, intervalMs = SYNC_INTERVAL_MS } = {}) {
+  if (!patchPath) return { run: async () => ({ ok: false, error: "no patch path" }), stop() {} };
+  const run = () => syncModels(patchPath, "timer").catch((err) => ({ ok: false, error: String(err) }));
+  run();
+  const timer = setInterval(run, intervalMs);
+  timer.unref?.();
+  return { run, stop() { clearInterval(timer); } };
 }
 
-const server = createServer((req, res) => {
-  const path = (req.url || "/").split("?")[0];
-  if (req.method === "POST" && path.endsWith("/chat/completions")) { handleChat(req, res); return; }
-  if (req.method === "GET" && path.endsWith("/models")) { handleModels(res); return; }
-  if (req.method === "GET" && path === "/sync") { handleSync(res); return; }
-  if (req.method === "GET" && (path === "/healthz" || path === "/")) {
-    sendJson(res, 200, { ok: true, service: "zen-relay", upstream: ZEN_BASE, session: sessionId });
-    return;
-  }
-  sendJson(res, 404, { error: { message: `zen-relay: no route for ${req.method} ${path}` } });
-});
+// ---------------------------------------------------------------------------
+// Server lifecycle
+// ---------------------------------------------------------------------------
+export async function startRelay(options = {}) {
+  const wanted = Number.isInteger(options.port) ? options.port : 9360;
+  const server = createServer((req, res) => {
+    const path = (req.url || "/").split("?")[0];
+    if (req.method === "POST" && path.endsWith("/chat/completions")) { handleChat(req, res); return; }
+    if (req.method === "GET" && path.endsWith("/models")) { handleModels(res); return; }
+    if (req.method === "GET" && path === "/sync") {
+      const patch = options.patchPath;
+      if (!patch) { sendJson(res, 400, { ok: false, error: "no patch path configured" }); return; }
+      syncModels(patch, "http").then((r) => sendJson(res, r.ok ? 200 : 500, r));
+      return;
+    }
+    if (req.method === "GET" && (path === "/healthz" || path === "/")) {
+      sendJson(res, 200, { ok: true, service: "zen-relay", version: RELAY_VERSION, upstream: ZEN_BASE, session: sessionId });
+      return;
+    }
+    sendJson(res, 404, { error: { message: `zen-relay: no route for ${req.method} ${path}` } });
+  });
 
-server.listen(PORT, "127.0.0.1", () => {
-  const msg = `zen-relay listening on http://127.0.0.1:${PORT} (session ${sessionId})`;
-  console.log(msg);
-  log({ t: "start", port: PORT, session: sessionId });
-  if (SYNC_ENABLED) {
-    syncModels("start").catch(() => {});
-    setInterval(() => { syncModels("interval").catch(() => {}); }, SYNC_INTERVAL_MS);
+  await new Promise((resolve, reject) => {
+    const onError = (err) => { server.off("listening", onListening); reject(err); };
+    const onListening = () => { server.off("error", onError); resolve(); };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(wanted, "127.0.0.1");
+  });
+  server.unref?.();
+  const port = server.address().port;
+  log({ t: "start", port, session: sessionId });
+
+  return {
+    port,
+    server,
+    external: false,
+    close: () => new Promise((done) => {
+      try { server.closeAllConnections?.(); } catch { /* ignore */ }
+      try { server.close(() => done()); } catch { done(); }
+    }),
+  };
+}
+
+export async function probeRelay(port) {
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/healthz`, { signal: AbortSignal.timeout(1500) });
+    if (!r.ok) return null;
+    const j = await r.json();
+    return j && j.service === "zen-relay" ? j : null;
+  } catch {
+    return null;
   }
-});
+}
+
+// ---------------------------------------------------------------------------
+// Standalone mode: node zen-relay.mjs
+//   ZEN_RELAY_PORT  listen port (default 9360)
+//   ZEN_PATCH       profile patch to sync (optional)
+// ---------------------------------------------------------------------------
+const invoked = process.argv[1] ? resolve(process.argv[1]).toLowerCase() : "";
+if (invoked && invoked === fileURLToPath(import.meta.url).toLowerCase()) {
+  const port = Number(process.env.ZEN_RELAY_PORT || 9360);
+  const patch = process.env.ZEN_PATCH || "";
+  startRelay({ port, patchPath: patch || undefined }).then((relay) => {
+    // startRelay unrefs the server so it never keeps DSH alive; standalone
+    // mode has no host event loop, so hold the process open explicitly.
+    relay.server?.ref?.();
+    console.log(`zen-relay listening on http://127.0.0.1:${relay.port} (session ${sessionId})`);
+    if (patch) {
+      startModelSync({ patchPath: patch });
+      console.log(`model sync    : ${patch} (start + every 6h + GET /sync)`);
+    }
+  }).catch((err) => {
+    console.error(`zen-relay: ${err.message}`);
+    process.exit(1);
+  });
+}

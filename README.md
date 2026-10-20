@@ -1,145 +1,102 @@
-# dsh-opencode — OpenCode Zen free models for DeepSeek Harness
+# dsh-opencode
 
-A small local relay that lets **DeepSeek Harness (DSH)** use **OpenCode Zen's
-free models without an API key**. One-command install, automatic model-list
-updates, reasoning-effort support.
+OpenCode Zen's **free models** inside **DeepSeek Harness** — installed as a real DSH plugin, with **no API key**.
+
+The plugin starts a small loopback relay that talks to Zen exactly like the official OpenCode CLI does, adds an `OpenCode Zen (free)` provider to the model picker, keeps the free-model list in step with the gateway, and exposes each model's real reasoning-effort levels.
 
 ## What it does
 
-- Runs a local relay on `127.0.0.1:9360` that re-shapes requests the same way
-  the official OpenCode CLI does for Zen's keyless free tier (identity
-  headers, `stream: true`, and a tool named `read`).
-- Adds a provider named **"OpenCode Zen (free)"** to your DSH profile.
-- Keeps the model list in sync with Zen: at relay start, every 6 hours, and on
-  demand. New free models appear and retired ones disappear automatically.
+- Registers itself on the **Plugins** page as a normal DSH plugin bundle.
+- Starts the relay **inside the DSH host** — no extra window, service, login item, or external process.
+- Ships a seed provider so the free models are present on the very first boot, then keeps the provider in the profile's user patch (`cordis.patch.yml`) in step.
+- Refreshes the free-model list from the gateway **at start**, **every 6 hours**, and **on demand**.
+- Maps `reasoningEfforts` for each model to the wire `reasoning_effort` DSH sends, so the effort picker shows the levels that model actually supports.
+- Stores no key, token, account, or credential. The relay listens on `127.0.0.1` only.
 
 ## Requirements
 
-- Windows 10/11 (DSH desktop)
-- Node.js **20 or newer** in PATH (`node -v`)
-- Internet access to `opencode.ai` (gateway) and `models.dev` (metadata)
+- DeepSeek Harness Desktop with the Plugins page (0.2.x).
+- Internet access to `opencode.ai` (gateway) and `models.dev` (model metadata).
 
 ## Install
 
-1. Download or clone this repository.
-2. Double-click `install.cmd` (or run `node install.mjs`).
-3. Start (or restart) DeepSeek Harness.
-4. In the model picker choose **"OpenCode Zen (free)"** and a model.
+1. Open **Plugins → Add plugin**.
+2. Paste this repository's Git address — copy it from your browser's address bar (the page you are reading this on).
+3. Click **Install**, then **Enable now** when it finishes.
+4. If DSH asks for a restart (profiles without HMR), restart it once.
+5. Open the model picker and choose **OpenCode Zen (free)**.
 
-The installer:
-
-- copies the runtime into `%USERPROFILE%\.dsh\zen-relay`
-- adds the `opencode-zen` route to
-  `%USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml`
-  (a timestamped `.bak-*` copy is kept next to it)
-- installs the Startup shortcut `dsh-opencode.lnk` (hidden autostart)
-- starts the relay and runs the first model sync
-
-Options:
+On activation the plugin writes the provider into
 
 ```
-node install.mjs --help
-  --profile <name>   DSH profile (default: desktop)
-  --patch <file>     explicit patch path
-  --port <n>         relay port (default: 9360; custom ports skip autostart)
-  --no-default       do not touch agent-default-model
-  --no-autostart     do not create the logon shortcut
-  --no-start         do not start the relay
-  --dry-run          preview, write nothing
-  --print-patch      print the patch block and exit (manual installs)
+~/.dsh/profiles/<profile>/cordis.patch.yml
 ```
 
-## Automatic model updates
+between the `# >>> zen-sync:models` and `# <<< zen-sync:models` markers, and chooses a starter free model only when the profile has no `agent-default-model` yet. Your own default provider is never replaced. The bundle layer already seeds the same provider so the model picker works on the first boot; the user patch is the durable, synced copy.
 
-The model list lives between two markers in the profile patch:
+### Other profiles (CLI)
 
-```yaml
-        models:
-          # >>> zen-sync:models
-          ... entries ...
-          # <<< zen-sync:models
+For a profile that is not the app-managed `desktop` one:
+
+```sh
+dsh plugin --profile <name> add <this-repository-url>
+dsh --profile <name> --dump-config    # optional: check the composed profile
 ```
 
-On each sync the relay reads the live `-free` list from the gateway, enriches
-it (display name, context window, max output, image input, reasoning levels)
-from `models.dev`, and rewrites only that block. The file is written only when
-something changed, and DSH hot-applies the patch — no restart needed.
+## Models and effort
 
-If the current default model is retired, the `agent-default-model` line tagged
-`# zen-sync:default` falls back to the first available model.
+- A free model is any gateway model whose id ends in `-free`.
+- Names, context window, output cap, image input, and reasoning levels come from the `opencode` catalog on `models.dev`; a model with no catalog entry still works from its gateway id.
+- Only declared effort levels are shown. Models with no declaration send no `reasoning_effort` and keep the gateway default.
 
-Manual trigger:
+## Model-list sync
 
-```
-curl http://127.0.0.1:9360/sync
-```
+The list is refreshed:
 
-## Files and locations
+- when the plugin starts,
+- every 6 hours,
+- and on `GET http://127.0.0.1:9360/sync`.
 
-```
-%USERPROFILE%\.dsh\zen-relay\
-  zen-relay.mjs          relay + model sync
-  zen-tools.json         captured tool definitions (gateway marker)
-  patch-lib.mjs          patch-editing helpers
-  prep-patch-markers.mjs marker repair tool
-  run-relay.cmd          watchdog/supervisor loop
-  start-hidden.vbs       starts the supervisor hidden
-  zen-relay.log          request metadata (no chat content)
-  relay-stdout.log       supervisor output
-```
+Only the block between the zen-sync markers is rewritten, and only when it changed. If the selected default model disappears, the marker line `# zen-sync:default` lets the sync move it to the first available free model.
 
-Start hidden by double-clicking `start-hidden.vbs` or the Startup shortcut.
-To stop, end the `node.exe` process running `zen-relay.mjs` in Task Manager.
-Delete the shortcut to disable autostart.
+## Port
 
-## Privacy and security
+The default is `9360`. If the port is already served by this version of the relay, the plugin reuses it. If another program (including a relay left by an older install) owns it, the plugin binds a free loopback port and writes that URL into the provider, so no manual configuration is needed. The chosen port is remembered in the user patch, so it stays put across restarts.
 
-- **No API key** is used or stored anywhere.
-- The relay listens on `127.0.0.1` only; it is not reachable from the network.
-- It contacts only `opencode.ai` and `models.dev`.
-- Logs contain request metadata (model, message/tool counts, status, timing) —
-  never chat content.
-- The free tier is unofficial use of OpenCode's gateway; use at your own risk
-  and respect the service's terms.
+## Privacy and safety
+
+- The relay listens on `127.0.0.1` only.
+- No API key, auth token, account, or credential is read or stored.
+- Project and session ids are generated locally and randomly each run.
+- The log is metadata only (`dsh-opencode-relay.log` in the system temp directory): model, status, timing, counts. No message bodies.
+- Chat content is forwarded to `opencode.ai`; that is the service being used.
+
+## Notes and limits
+
+- Free-tier availability, quotas, and rate limits are controlled by OpenCode Zen, not by this plugin.
+- The gateway occasionally cold-starts a free model with a transient `Endpoint is unavailable`; the relay retries briefly before surfacing an error.
+- OpenCode can rename or retire models at any time; the sync follows the gateway.
+- This project is not affiliated with OpenCode or DeepSeek.
 
 ## Uninstall
 
-1. Delete the Startup shortcut `dsh-opencode.lnk`.
-2. End the relay process and delete `%USERPROFILE%\.dsh\zen-relay`.
-3. Restore the patch backup (`cordis.patch.yml.bak-*`) or remove the
-   `llm-pi-ai` and `agent-default-model` entries the installer added.
+1. **Plugins → dsh-opencode → Remove** (or switch the bundle off).
+2. Optional cleanup: in `~/.dsh/profiles/<profile>/cordis.patch.yml`, delete the `llm-pi-ai` entry that contains the zen-sync markers. The plugin keeps a one-time backup at `cordis.patch.yml.bak-dsh-opencode`.
+3. Restart DSH.
 
-## Troubleshooting
+Leaving the block in place is harmless apart from the model picker still listing models whose relay is no longer running.
 
-| Symptom | Fix |
-| --- | --- |
-| `403 FreeTierError` | The gateway rejected the request shape or the exit IP. Some VPN exit IPs are refused by the free-tier guard — if 403s only happen with a VPN on, try another VPN location. Also make sure the relay is running and restart it after editing files. |
-| `429 FreeUsageLimitError` | Short-window rate limit; wait a bit and retry. |
-| `Connection refused` | The relay is not running: start `start-hidden.vbs`. |
-| Model list missing or stale | Check `zen-relay.log` for a `sync` line. `no-markers` means the sync markers were removed — run `node prep-patch-markers.mjs <patch>`. Sync needs internet. |
-| Port 9360 already in use | Stop the other program, or run the relay with `ZEN_RELAY_PORT=<port>` and change the provider `baseURL` in the patch to match. |
-| `node` not found | Install Node.js 20+ from https://nodejs.org. |
+## Files
 
-## Manual install
-
-`node install.mjs --print-patch` prints the YAML block without touching
-anything. Paste it into the profile patch, keep the markers, and start the
-relay manually.
-
-## Environment variables
-
-| Variable | Purpose |
-| --- | --- |
-| `ZEN_RELAY_PORT` | relay port (default 9360) |
-| `ZEN_PATCH` | patch file the sync maintains |
-| `ZEN_SYNC=off` | disable the model sync |
-| `ZEN_SYNC_INTERVAL_MS` | sync period (default 6 h) |
-| `ZEN_RELAY_DEBUG=1` | also print log lines to stdout |
-| `ZEN_RELAY_DUMP=1` | dump the last shaped request to `zen-relay-dump.json` |
-| `ZEN_RELAY_PROJECT` | fixed project id (default: random per run) |
-| `ZEN_RELAY_UPSTREAM` | alternate gateway base URL |
-| `ZEN_CATALOG_URL` | alternate metadata catalog URL |
+| File | Role |
+|---|---|
+| `index.js` | Host plugin: relay lifecycle, profile patch provisioning, sync timer |
+| `zen-relay.mjs` | OpenAI-compatible loopback relay + model sync (zero dependencies) |
+| `patch-lib.mjs` | Safe, marker-aware text edits for `cordis.patch.yml` |
+| `cordis.patch.yml` | Bundle layer: seeds the provider/default model and inserts the host plugin row |
+| `zen-tools.json` | Read-tool marker schema used to keep the client identity compatible |
+| `locale/*.json`, `icon.svg` | Plugin display metadata |
 
 ## License
 
-MIT — see `LICENSE`.
+MIT

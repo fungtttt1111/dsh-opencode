@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "OpenCode Zen 免费模型",
+    "description": "通过本地中继接入 OpenCode Zen 的免密钥免费模型，自动刷新模型列表，并支持每个模型的推理强度选择。"
+  }
+}

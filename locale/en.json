@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "OpenCode Zen Free Models",
+    "description": "Adds OpenCode Zen's keyless free models through a local relay, with automatic model-list refresh and per-model reasoning effort."
+  }
+}
